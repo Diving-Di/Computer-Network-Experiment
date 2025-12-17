@@ -1,4 +1,4 @@
-#include "socket.hh"
+#include "tcp_sponge_socket.hh"
 #include "util.hh"
 
 #include <cstdlib>
@@ -7,18 +7,26 @@
 using namespace std;
 
 void get_URL(const string &host, const string &path) {
-    // Your code here.
+    // TCPSocket sock;
+    FullStackSocket sock;
+    sock.connect(Address(host, "http"));
 
-    // You will need to connect to the "http" service on
-    // the computer whose name is in the "host" string,
-    // then request the URL path given in the "path" string.
+    // Minimal HTTP/1.1 request with required Host header.
+    string request = "GET " + path + " HTTP/1.1\r\n";
+    request += "Host: " + host + "\r\n";
+    request += "Connection: close\r\n";
+    request += "\r\n";
 
-    // Then you'll need to print out everything the server sends back,
-    // (not just one call to read() -- everything) until you reach
-    // the "eof" (end of file).
+    sock.write(request);
+    // Signal end of request body.
+    sock.shutdown(SHUT_WR);
 
-    cerr << "Function called: get_URL(" << host << ", " << path << ").\n";
-    cerr << "Warning: get_URL() has not been implemented yet.\n";
+    // Read until EOF and print to stdout.
+    while (!sock.eof()) {
+        string data = sock.read();
+        cout << data;
+    }
+    sock.wait_until_closed();
 }
 
 int main(int argc, char *argv[]) {
