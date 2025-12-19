@@ -1,20 +1,14 @@
 #include "func.h"
 
+#include <atomic>
 #include <limits>
 
 namespace {
 
-bool SendAll(const int sock, const char* data, const size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        const ssize_t n = ::send(sock, data + sent, len - sent, 0);
-        if (n <= 0) {
-            return false;
-        }
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
+constexpr int kTimeBurstCount = 100;
+
+std::atomic<int> time_expected {0};
+std::atomic<int> time_received {0};
 
 bool SendPacket(const char type, const std::string& payload = "") {
     // TODO: 组装报文（type + payload）并发送
@@ -24,11 +18,21 @@ bool SendPacket(const char type, const std::string& payload = "") {
     }
 
     std::string packet;
-    packet.reserve(1 + payload.size());
+    // 以 '\n' 作为包结束符，便于接收端在 TCP 字节流中拆包。
+    packet.reserve(2 + payload.size());
     packet.push_back(type);
     packet += payload;
+    packet.push_back('\n');
 
-    return SendAll(BaseSock, packet.data(), packet.size());
+    size_t sent = 0;
+    while (sent < packet.size()) {
+        const ssize_t n = ::send(BaseSock, packet.data() + sent, packet.size() - sent, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
 }
 
 }  // namespace
@@ -120,9 +124,17 @@ void ServerDisconnect() {
 void GetTime() {
     // TODO: 发送 TIME 请求
     std::cout << "\n[TIME]\n";
-    if (SendPacket(TIME)) {
-        std::cout << "[SYS] Request Sending Success\n";
+
+    time_expected.store(kTimeBurstCount);
+    time_received.store(0);
+
+    int sent_ok = 0;
+    for (int i = 0; i < kTimeBurstCount; ++i) {
+        if (SendPacket(TIME)) {
+            ++sent_ok;
+        }
     }
+    std::cout << "[SYS] TIME requests sent: " << sent_ok << "/" << kTimeBurstCount << "\n";
 }
 
 void GetName() {
@@ -189,80 +201,106 @@ void* Recieve(void* lpParameter) {
     // SIGNAL: 打印来自其他客户端的消息（id$内容）
     (void)lpParameter;
 
+    std::string inbuf;
+    inbuf.reserve(MAXBUF * 2);
+
     char buffer[MAXBUF];
     while (connected && BaseSock >= 0) {
         const ssize_t n = ::recv(BaseSock, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             break;
         }
-        const char type = buffer[0];
-        const std::string payload(buffer + 1, buffer + n);
 
-        switch (type) {
-            case CONNECT:
-                std::cout << "\n[SYS] Your Client ID is " << payload << "\n";
-                break;
-            case TIME:
-                std::cout << "\n[SYS] Current Time is: " << payload << "\n";
-                break;
-            case NAME:
-                std::cout << "\n[SYS] Name of machine is: " << payload << "\n";
-                break;
-            case LIST: {
-                std::cout << "\n[SYS] Current Clients List is: ";
-                if (payload.empty()) {
-                    std::cout << "(empty)\n";
+        inbuf.append(buffer, buffer + n);
+
+        size_t line_end = 0;
+        while ((line_end = inbuf.find('\n')) != std::string::npos) {
+            const std::string packet = inbuf.substr(0, line_end);
+            inbuf.erase(0, line_end + 1);
+
+            if (packet.empty()) {
+                continue;
+            }
+
+            const char type = packet[0];
+            const std::string payload = packet.substr(1);
+
+            switch (type) {
+                case CONNECT:
+                    std::cout << "\n[SYS] Your Client ID is " << payload << "\n";
+                    break;
+                case TIME: {
+                    const int got = time_received.fetch_add(1) + 1;
+                    const int expected = time_expected.load();
+                    if (expected > 0) {
+                        std::cout << "\n[SYS] (" << got << "/" << expected << ") Current Time is: " << payload << "\n";
+                        if (got == expected) {
+                            std::cout << "[SYS] Received all TIME responses: " << got << "/" << expected << "\n";
+                        }
+                    } else {
+                        std::cout << "\n[SYS] Current Time is: " << payload << "\n";
+                    }
                     break;
                 }
-                // payload: id1$id2$...
-                size_t start = 0;
-                bool first = true;
-                while (start < payload.size()) {
-                    const size_t pos = payload.find('$', start);
-                    const std::string id = (pos == std::string::npos) ? payload.substr(start) : payload.substr(start, pos - start);
-                    if (!id.empty()) {
-                        if (!first) {
-                            std::cout << ", ";
-                        }
-                        std::cout << id;
-                        first = false;
-                    }
-                    if (pos == std::string::npos) {
+                case NAME:
+                    std::cout << "\n[SYS] Name of machine is: " << payload << "\n";
+                    break;
+                case LIST: {
+                    std::cout << "\n[SYS] Current Clients List is: ";
+                    if (payload.empty()) {
+                        std::cout << "(empty)\n";
                         break;
                     }
-                    start = pos + 1;
+                    // payload: id1$id2$...
+                    size_t start = 0;
+                    bool first = true;
+                    while (start < payload.size()) {
+                        const size_t pos = payload.find('$', start);
+                        const std::string id = (pos == std::string::npos) ? payload.substr(start) : payload.substr(start, pos - start);
+                        if (!id.empty()) {
+                            if (!first) {
+                                std::cout << ", ";
+                            }
+                            std::cout << id;
+                            first = false;
+                        }
+                        if (pos == std::string::npos) {
+                            break;
+                        }
+                        start = pos + 1;
+                    }
+                    std::cout << "\n";
+                    break;
                 }
-                std::cout << "\n";
-                break;
-            }
-            case SIGNAL: {
-                // payload: fromId$content
-                const size_t pos = payload.find('$');
-                if (pos == std::string::npos) {
-                    std::cout << "\n[RECEIVE MESSAGE]\n";
-                    std::cout << "[SYS] Receive a message:\n";
-                    std::cout << payload << "\n";
-                } else {
-                    const std::string from = payload.substr(0, pos);
-                    const std::string content = payload.substr(pos + 1);
-                    std::cout << "\n[RECEIVE MESSAGE]\n";
-                    std::cout << "[SYS] Client " << from << " Just Sent A Message to you:\n";
-                    std::cout << content << "\n";
+                case SIGNAL: {
+                    // payload: fromId$content
+                    const size_t pos = payload.find('$');
+                    if (pos == std::string::npos) {
+                        std::cout << "\n[RECEIVE MESSAGE]\n";
+                        std::cout << "[SYS] Receive a message:\n";
+                        std::cout << payload << "\n";
+                    } else {
+                        const std::string from = payload.substr(0, pos);
+                        const std::string content = payload.substr(pos + 1);
+                        std::cout << "\n[RECEIVE MESSAGE]\n";
+                        std::cout << "[SYS] Client " << from << " Just Sent A Message to you:\n";
+                        std::cout << content << "\n";
+                    }
+                    break;
                 }
-                break;
+                case MESSAGE:
+                    std::cout << "\n[SYS] " << payload << "\n";
+                    break;
+                case INVALID:
+                    std::cout << "\n[SYS] " << payload << "\n";
+                    break;
+                default:
+                    std::cout << "\n[SYS] Unknown packet type: " << static_cast<int>(type) << ", payload: " << payload << "\n";
+                    break;
             }
-            case MESSAGE:
-                std::cout << "\n[SYS] " << payload << "\n";
-                break;
-            case INVALID:
-                std::cout << "\n[SYS] " << payload << "\n";
-                break;
-            default:
-                std::cout << "\n[SYS] Unknown packet type: " << static_cast<int>(type) << ", payload: " << payload << "\n";
-                break;
-        }
 
-        PrintPrompt();
+            PrintPrompt();
+        }
     }
 
     if (connected) {

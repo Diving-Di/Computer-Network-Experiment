@@ -14,18 +14,6 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 可选的工具函数示例（需要同学们完成或替换）
 namespace {
 
-bool SendAll(const int sock, const char* data, const size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        const ssize_t n = ::send(sock, data + sent, len - sent, 0);
-        if (n <= 0) {
-            return false;
-        }
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
-
 std::string CurrentTimeString() {
     const std::time_t now = std::time(nullptr);
     std::string s = std::ctime(&now);
@@ -57,10 +45,21 @@ int GetClientIdLocked(const int sock) {
 bool SendPacket(int sock, char type, const std::string& payload) {
     // TODO: 组装报文（类型 + 负载）并通过 send 发送
     std::string packet;
-    packet.reserve(1 + payload.size());
+    // 以 '\n' 作为包结束符，便于接收端在 TCP 字节流中拆包。
+    packet.reserve(2 + payload.size());
     packet.push_back(type);
     packet += payload;
-    return SendAll(sock, packet.data(), packet.size());
+    packet.push_back('\n');
+
+    size_t sent = 0;
+    while (sent < packet.size()) {
+        const ssize_t n = ::send(sock, packet.data() + sent, packet.size() - sent, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
 }
 
 void RemoveClient(int sock) {
@@ -144,6 +143,10 @@ void* Recieve(void* lpParameter) {
     static int next_id = 1;
 
     int self_id = -1;
+    int time_req_count = 0;
+
+    std::string inbuf;
+    inbuf.reserve(MAXBUF * 2);
 
     char buffer[MAXBUF];
     while (true) {
@@ -152,111 +155,127 @@ void* Recieve(void* lpParameter) {
             break;
         }
 
-        const char type = buffer[0];
-        const std::string payload(buffer + 1, buffer + n);
+        inbuf.append(buffer, buffer + n);
 
-        if (type == CONNECT) {
-            int id = -1;
+        size_t line_end = 0;
+        while ((line_end = inbuf.find('\n')) != std::string::npos) {
+            const std::string packet = inbuf.substr(0, line_end);
+            inbuf.erase(0, line_end + 1);
+
+            if (packet.empty()) {
+                continue;
+            }
+
+            const char type = packet[0];
+            const std::string payload = packet.substr(1);
+
+            if (type == CONNECT) {
+                int id = -1;
+                pthread_mutex_lock(&clients_mutex);
+                id = next_id++;
+                clients[sock] = id;
+                pthread_mutex_unlock(&clients_mutex);
+
+                std::cout << "[SRV] Client " << id << " connect successfully!\n";
+                (void)SendPacket(sock, CONNECT, std::to_string(id));
+                std::cout << "[SRV] Client ID returned.\n";
+                continue;
+            }
+
             pthread_mutex_lock(&clients_mutex);
-            id = next_id++;
-            clients[sock] = id;
+            self_id = GetClientIdLocked(sock);
             pthread_mutex_unlock(&clients_mutex);
 
-            std::cout << "[SRV] Client " << id << " connect successfully!\n";
-            (void)SendPacket(sock, CONNECT, std::to_string(id));
-            std::cout << "[SRV] Client ID returned.\n";
-            continue;
-        }
-
-        pthread_mutex_lock(&clients_mutex);
-        self_id = GetClientIdLocked(sock);
-        pthread_mutex_unlock(&clients_mutex);
-
-        if (type == TIME) {
-            std::cout << "[SRV] Receive a TIME request from client " << self_id << "\n";
-            (void)SendPacket(sock, TIME, CurrentTimeString());
-            std::cout << "[SRV] Time Sending Back Successfully.\n";
-            continue;
-        }
-
-        if (type == NAME) {
-            std::cout << "[SRV] Receive a NAME request from client " << self_id << "\n";
-            (void)SendPacket(sock, NAME, HostnameString());
-            std::cout << "[SRV] Name Sending Back Successfully.\n";
-            continue;
-        }
-
-        if (type == LIST) {
-            std::cout << "[SRV] Receive a LIST request from client " << self_id << "\n";
-            std::string list_payload;
-            pthread_mutex_lock(&clients_mutex);
-            for (const auto& [csock, cid] : clients) {
-                if (cid > 0) {
-                    list_payload += std::to_string(cid);
-                    list_payload += '$';
+            if (type == TIME) {
+                ++time_req_count;
+                (void)SendPacket(sock, TIME, CurrentTimeString());
+                if (time_req_count == 100) {
+                    std::cout << "[SRV] Client " << self_id << " TIME handled 100 times.\n";
                 }
-            }
-            pthread_mutex_unlock(&clients_mutex);
-            (void)SendPacket(sock, LIST, list_payload);
-            std::cout << "[SRV] List Sending Back Successfully.\n";
-            continue;
-        }
-
-        if (type == MESSAGE) {
-            std::cout << "[SRV] Receive a MESSAGE request from client " << self_id << "\n";
-            const size_t pos = payload.find('$');
-            if (pos == std::string::npos) {
-                (void)SendPacket(sock, MESSAGE, "Bad format. Use: id$content");
-                continue;
-            }
-            const std::string id_str = payload.substr(0, pos);
-            const std::string content = payload.substr(pos + 1);
-
-            int target_id = -1;
-            try {
-                target_id = std::stoi(id_str);
-            } catch (...) {
-                (void)SendPacket(sock, MESSAGE, "Bad target id.");
                 continue;
             }
 
-            int sender_id = -1;
-            pthread_mutex_lock(&clients_mutex);
-            sender_id = GetClientIdLocked(sock);
-            pthread_mutex_unlock(&clients_mutex);
-            if (sender_id <= 0) {
-                (void)SendPacket(sock, MESSAGE, "Please CONNECT first.");
+            if (type == NAME) {
+                std::cout << "[SRV] Receive a NAME request from client " << self_id << "\n";
+                (void)SendPacket(sock, NAME, HostnameString());
+                std::cout << "[SRV] Name Sending Back Successfully.\n";
                 continue;
             }
 
-            int target_sock = -1;
-            pthread_mutex_lock(&clients_mutex);
-            for (const auto& [csock, cid] : clients) {
-                if (cid == target_id) {
-                    target_sock = csock;
-                    break;
+            if (type == LIST) {
+                std::cout << "[SRV] Receive a LIST request from client " << self_id << "\n";
+                std::string list_payload;
+                pthread_mutex_lock(&clients_mutex);
+                for (const auto& [csock, cid] : clients) {
+                    if (cid > 0) {
+                        list_payload += std::to_string(cid);
+                        list_payload += '$';
+                    }
                 }
-            }
-            pthread_mutex_unlock(&clients_mutex);
-
-            if (target_sock < 0) {
-                (void)SendPacket(sock, MESSAGE, "Target client not found.");
+                pthread_mutex_unlock(&clients_mutex);
+                (void)SendPacket(sock, LIST, list_payload);
+                std::cout << "[SRV] List Sending Back Successfully.\n";
                 continue;
             }
 
-            const std::string forward_payload = std::to_string(sender_id) + "$" + content;
-            (void)SendPacket(target_sock, SIGNAL, forward_payload);
-            std::cout << "[SRV] Message Sending Success\n";
-            continue;
-        }
+            if (type == MESSAGE) {
+                std::cout << "[SRV] Receive a MESSAGE request from client " << self_id << "\n";
+                const size_t pos = payload.find('$');
+                if (pos == std::string::npos) {
+                    (void)SendPacket(sock, MESSAGE, "Bad format. Use: id$content");
+                    continue;
+                }
+                const std::string id_str = payload.substr(0, pos);
+                const std::string content = payload.substr(pos + 1);
 
-        if (type == DISCONNECT) {
-            std::cout << "[SRV] Client " << self_id << " requested disconnect.\n";
-            break;
-        }
+                int target_id = -1;
+                try {
+                    target_id = std::stoi(id_str);
+                } catch (...) {
+                    (void)SendPacket(sock, MESSAGE, "Bad target id.");
+                    continue;
+                }
 
-        (void)SendPacket(sock, INVALID, "Unknown packet type.");
+                int sender_id = -1;
+                pthread_mutex_lock(&clients_mutex);
+                sender_id = GetClientIdLocked(sock);
+                pthread_mutex_unlock(&clients_mutex);
+                if (sender_id <= 0) {
+                    (void)SendPacket(sock, MESSAGE, "Please CONNECT first.");
+                    continue;
+                }
+
+                int target_sock = -1;
+                pthread_mutex_lock(&clients_mutex);
+                for (const auto& [csock, cid] : clients) {
+                    if (cid == target_id) {
+                        target_sock = csock;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&clients_mutex);
+
+                if (target_sock < 0) {
+                    (void)SendPacket(sock, MESSAGE, "Target client not found.");
+                    continue;
+                }
+
+                const std::string forward_payload = std::to_string(sender_id) + "$" + content;
+                (void)SendPacket(target_sock, SIGNAL, forward_payload);
+                std::cout << "[SRV] Message Sending Success\n";
+                continue;
+            }
+
+            if (type == DISCONNECT) {
+                std::cout << "[SRV] Client " << self_id << " requested disconnect.\n";
+                goto disconnect;
+            }
+
+            (void)SendPacket(sock, INVALID, "Unknown packet type.");
+        }
     }
+
+disconnect:
 
 
     if (self_id <= 0) {
